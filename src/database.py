@@ -9,7 +9,7 @@ import random
 def _get_mock_data():
     """Generates mock data for testing purposes."""
     rows = 50
-    command_types = ['Type 1', 'addphone', 'addtv', 'Type 1', 'addphone']
+    command_types = ['1', 'addphone', 'addtv', '1', 'addphone']
     statuses = ['Success', 'Error', 'Pending']
     errors = [
         'Connection timeout to switch',

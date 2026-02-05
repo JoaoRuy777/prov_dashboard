@@ -267,7 +267,7 @@ if selected_view == 'Visão Geral':
 
 elif selected_view == 'Dados (Internet)':
     st.title("Monitoramento - Internet (Dados)")
-    target_types = ['Type 1', '1'] 
+    target_types = ['1'] 
     df_view = df_filtered_date[df_filtered_date['command_type'].isin(target_types)]
     
     if df_view.empty:
