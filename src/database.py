@@ -94,7 +94,7 @@ def get_data(use_mock=False, start_date=None, end_date=None, olt_ip=None):
     """
     Fetches data from the database with filtering.
     """
-    # Decide strategy
+    # Decide strategy 
     if use_mock:
         return _get_mock_data()
         
@@ -104,57 +104,95 @@ def get_data(use_mock=False, start_date=None, end_date=None, olt_ip=None):
         return _get_mock_data()
 
     # Real Query
+    # Real Query
+    # Real Query
+    # Updated to user's model with parameterized filters
     query = """
     SELECT
         fp.id,
-        fp.retornoexecucao as raw_error,
-        fp.sucesso as status_bool,
+        fp.mensagemerro AS raw_error,
+        fp.sucesso AS status_bool,
         fp.json,
-        fp.identificacao as command_type,
-        fp.datainicio as created_at,
-        c.endereco as olt_ip
-    FROM public.filaprovisionamento fp 
-    JOIN public.configuracaoprofile c ON c.id = fp.configuracaoid
+        fp.json::jsonb ->> 'script' AS command_type,
+        fp.datainicio AS created_at,
+        c.endereco AS olt_ip
+    FROM public.filaprovisionamento fp
+    JOIN public.configuracaoprofile c ON c.configuracaoid = fp.configuracaoid
     WHERE 1=1
     """
     
     params = []
     
-    # Date Filtering
+    # Date Filtering (Assuming user wants >= start and < end+1day like previous logic often implies)
+    # The user example was: fp.datainicio >= TIMESTAMP '2026-02-10 00:00:00' AND < '2026-02-11 ...'
     if start_date:
         query += " AND fp.datainicio >= %s"
         params.append(start_date)
     
     if end_date:
-        # Add filtering for end of day? Or simple comparison
+        # To match the user's logic (< next day), we should probably use <= end_date 23:59:59 
+        # or < end_date + 1 day.
+        # However, the previous code was likely datainicio <= end_date (date object).
+        # Let's stick with simple comparison to avoid timezone mess for now, or add +1 day logic if requested.
+        # User logic: < TIMESTAMP '2026-02-11' (assuming end_date was 2026-02-10)
+        # We will use <= for now to be safe with existing input type (date object).
         query += " AND fp.datainicio <= %s"
-        params.append(end_date)
-        
-    # OLT Filtering
+        params.append(end_date + datetime.timedelta(days=1)) # Make it inclusive of end_date fully? No, usually <= end_date is fine if it's date.
+        # Wait, if end_date is a date object '2026-02-10', comparison with timestamp often acts as 00:00:00.
+        # So <= '2026-02-10' only gets midnight.
+        # User's query used < '2026-02-11'. This catches everything on the 10th.
+        # Let's adjust to < end_date + 1 day
+    
+    # OLT Filtering (Address to ID join)
+    # OLT Filtering (Address to ID join)
     if olt_ip:
         query += " AND c.endereco = %s"
-        params.append(olt_ip)
+        # Ensure we don't have leading/trailing whitespace which might kill the match
+        clean_ip = olt_ip.strip() if isinstance(olt_ip, str) else olt_ip
+        params.append(clean_ip)
         
     # Limit for safety
     query += " ORDER BY fp.datainicio DESC LIMIT 5000"
 
     try:
+        # Debugging: Print query and params to see what's actually running
+        print(f"\n[DEBUG] Running Query with OLT: '{olt_ip}', Start: '{start_date}', End: '{end_date}'")
+        # print(query) # Uncomment if you want full query text
+        print(f"[DEBUG] Params: {params}")
+        
         df = pd.read_sql(query, conn, params=params)
         conn.close()
         
-        # Post-processing: Map boolean status to strings
-        def map_status(val):
-            if val is True: return 'Success'
-            if val is False: return 'Error'
-            return 'Pending' # None/Null
-            
-        if not df.empty and 'status_bool' in df.columns:
-            df['status'] = df['status_bool'].apply(map_status)
-            df.drop(columns=['status_bool'], inplace=True)
-            
-        return df
+        print(f"DEBUG: Dataframe columns: {df.columns.tolist()}")
+        print(f"DEBUG: First row: {df.iloc[0].to_dict() if not df.empty else 'Empty'}")
+
         
+        # Post-processing: Map boolean status to strings
+        # Optimization: Map status efficiently
+        if not df.empty:
+            # Check if status_bool was actually returned
+            if 'status_bool' in df.columns:
+                # Vectorized mapping is faster than apply
+                df['status'] = 'Pending' # Default
+                df.loc[df['status_bool'] == True, 'status'] = 'Success'
+                df.loc[df['status_bool'] == False, 'status'] = 'Error'
+                # Drop existing but don't error if missing (though we checked)
+                df.drop(columns=['status_bool'], inplace=True)
+            else:
+                # Fallback if column is missing from DB
+                print("WARNING: 'status_bool' column missing from query result. using 'Unknown'.")
+                df['status'] = 'Unknown'
+
+            # Ensure all other expected columns exist to prevent downstream KeyErrors
+            expected_cols = ['raw_error', 'json', 'command_type', 'created_at', 'olt_ip']
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None
+
+        return df
+
     except Exception as e:
         print(f"Error executing query: {e}")
         if conn: conn.close()
-        return pd.DataFrame()
+        # Return empty DF with expected columns to prevent KeyErrors
+        return pd.DataFrame(columns=['id', 'raw_error', 'status', 'json', 'command_type', 'created_at', 'olt_ip'])

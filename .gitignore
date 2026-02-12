@@ -1,40 +1,20 @@
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+.venv/
+venv/
+ENV/
 
 # Streamlit
 .streamlit/secrets.toml
-.streamlit/credentials.toml
 
-# Virtual Environment
-venv/
-env/
-ENV/
-.env
-
-# IDE
-.vscode/
-.idea/
-
-# Custom
-logo.png # Se a logo for confidencial ou grande binary, opcional
+# Project specific debug/temp files
+debug_*.py
+diagnose_imports.py
+db_sample.txt
+db_schema.txt
+schema_info.txt
+debug_olt.txt
+debug_output_v2.txt

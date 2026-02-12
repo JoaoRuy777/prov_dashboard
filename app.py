@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.database import get_data, get_olts
 from src.processing import process_data, filter_data
+from src.olt_connector import OLTConnection
 
 # ... (Config and CSS remain headers) ...
 
@@ -37,7 +38,8 @@ view_options = {
     'Dados (Internet)': 'Dados (Internet)', 
     'TV': 'TV', 
     'Telefonia': 'Telefonia', 
-    'Base Completa': 'Base Completa', 
+    'Base Completa': 'Base Completa',
+    'Extração OLT': 'Extração OLT', 
     'Relatórios': 'Relatórios'
 }
 
@@ -52,7 +54,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("Filtros Globais")
 
 # Auto-Refresh Toggle
-auto_refresh = st.sidebar.toggle("🔁 Atualização Automática (30s)", value=False)
+auto_refresh = st.sidebar.toggle("Atualização Automática (30s)", value=False)
 
 # form for filters to prevent auto-reload on every change
 with st.sidebar.form("filter_form"):
@@ -73,7 +75,7 @@ with st.sidebar.form("filter_form"):
         max_value=today
     )
     
-    submit_button = st.form_submit_button("🔍 Buscar Dados")
+    submit_button = st.form_submit_button("Buscar Dados")
 
 # --- Data Loading Logic ---
 if submit_button or auto_refresh:
@@ -101,8 +103,14 @@ if submit_button or auto_refresh:
             processed_df = process_data(raw_df)
             st.session_state['df_cache'] = processed_df
             st.session_state['data_fetched'] = True
+            
+            st.success(f"Encontrados {len(raw_df)} registros.")
+            with st.expander("Detalhes do Filtro Ativo"):
+                 st.write(f"**OLT:** {olt_ip_query}")
+                 st.write(f"**Período:** {start_date} até {end_date}")
         else:
             st.warning("Nenhum dado encontrado para os filtros selecionados.")
+            st.info(f"Filtros utilizados: OLT='{olt_ip_query}', Data Início='{start_date}', Data Fim='{end_date}'")
             st.session_state['df_cache'] = pd.DataFrame()
 
 df_full = st.session_state['df_cache']
@@ -113,11 +121,13 @@ df_filtered_date = df_full
 
 # --- Views Implementation ---
 if not st.session_state['data_fetched'] and not submit_button:
-    st.info("👈 Utilize os filtros na barra lateral e clique em 'Buscar Dados' para começar.")
+    st.info("Utilize os filtros na barra lateral e clique em 'Buscar Dados' para começar.")
+    st.stop() # Stop execution here
 elif df_filtered_date.empty:
     st.warning("Sem dados para exibir.")
+    st.stop() # Stop execution here
 else:
-    # ... views render logic continues ...
+    # Data is ready
     pass 
 
 
@@ -179,7 +189,7 @@ def render_charts(df):
         else:
             div_success = """
             <div style="display: flex; justify-content: center; align-items: center; height: 300px; color: green; font-weight: bold;">
-                ✓ Operação 100% Sucesso
+                Operação 100% Sucesso
             </div>
             """
             st.markdown(div_success, unsafe_allow_html=True)
@@ -311,7 +321,7 @@ elif selected_view == 'Base Completa':
     st.dataframe(df_filtered_date, use_container_width=True)
 
 elif selected_view == 'Relatórios':
-    st.title("📑 Exportação de Relatórios")
+    st.title("Exportação de Relatórios")
     st.markdown("Selecione os dados e colunas para gerar seu relatório em Excel.")
     
     col_filt1, col_filt2 = st.columns(2)
@@ -348,12 +358,82 @@ elif selected_view == 'Relatórios':
             df_export.to_excel(writer, index=False, sheet_name='Relatório')
             
         st.download_button(
-            label="📥 Baixar Excel",
+            label="Baixar Excel",
             data=buffer.getvalue(),
             file_name="relatorio_provisionamento.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
+
+elif selected_view == 'Extração OLT':
+    st.title("Extração Direta da OLT")
+    st.markdown("Conecte-se em tempo real na OLT para extrair o status das ONUs.")
+
+    with st.form("olt_extract_form"):
+        col_olt1, col_olt2 = st.columns(2)
+        with col_olt1:
+             # Re-use get_olts helper or fetch distinct list again? 
+             # We can reuse database.get_olts() but need to handle if not cached. 
+             # Ideally pass existing dropdown items if available?
+             # For now, duplicate call is safer or fetch specific list.
+             # Let's rely on cached list if possible or call get_olts()
+             # To be safe, recall it.
+             avail_olts = get_olts() 
+             olt_target = st.selectbox("Selecione a OLT", avail_olts)
+        
+        with col_olt2:
+            vendor = st.selectbox("Vendor / Fabricante", ["Nokia", "Zhone"])
+            
+        col_slot, col_port = st.columns(2)
+        with col_slot:
+            slot_input = st.text_input("Slot", value="1", help="Ex: 3")
+        with col_port:
+            port_input = st.text_input("Porta PON", value="1", help="Ex: 13")
+            
+        # Optional: Credentials Override
+        with st.expander("Credenciais (Opcional - Substituir Banco)"):
+            user_ov = st.text_input("Usuário", value="")
+            pass_ov = st.text_input("Senha", type="password", value="")
+
+        btn_extract = st.form_submit_button("Executar Extração")
+    
+    if btn_extract:
+        st.info(f"Conectando a {olt_target} ({vendor})... Aguarde.")
+        
+        try:
+            # Clean inputs
+            ip_clean = olt_target.strip()
+            # If IP is "Name (IP)" format, logic needs split. But get_olts returns straight string "172..." usually based on DB.
+            # Assuming it's IP. 
+            
+            connector = OLTConnection(ip_clean, user_override=user_ov if user_ov else None, pass_override=pass_ov if pass_ov else None)
+            
+            # Execute
+            df_res, raw_log = connector.execute_command(vendor, slot=slot_input, port=port_input)
+            
+            if raw_log:
+                st.subheader("Retorno da OLT")
+                st.code(raw_log)
+                
+                # Excel Download Option for Raw Log
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    pd.DataFrame([{'Log': raw_log}]).to_excel(writer, index=False, sheet_name='Log Bruto')
+                    if df_res is not None and not df_res.empty:
+                         df_res.to_excel(writer, index=False, sheet_name='Dados Estruturados')
+                    
+                st.download_button(
+                    label="Baixar Log (Excel)",
+                    data=buffer.getvalue(),
+                    file_name=f"olt_log_{vendor}_{slot}_{port}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="secondary"
+                )
+            else:
+                 st.error("Falha na conexão ou comando vazio.")
+                    
+        except Exception as e:
+            st.error(f"Erro Crítico: {e}")
 
 # --- Auto Refresh Logic ---
 if auto_refresh:
