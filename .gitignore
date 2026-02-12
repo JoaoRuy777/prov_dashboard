@@ -18,3 +18,4 @@ db_schema.txt
 schema_info.txt
 debug_olt.txt
 debug_output_v2.txt
+*.log

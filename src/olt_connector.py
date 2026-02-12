@@ -115,7 +115,6 @@ class OLTConnection:
                     'port': tunnel.local_bind_port, # The random local port
                     'username': self.user,
                     'password': self.password,
-                    'global_delay_factor': 2,
                 }
                 
                 # Connect
@@ -141,12 +140,42 @@ class OLTConnection:
                     # Zhone
                     elif vendor == 'Zhone':
                         net_connect.send_command("setline 0")
+                        
                         cmd_show = f"onu showall {slot}/{port}"
                         output_text += f"\n--- CMD: {cmd_show} ---\n"
-                        out = net_connect.send_command_timing(cmd_show)
+                        
+                        # Regex to capture:
+                        # 1. Standard prompts (# or >)
+                        # 2. The specific paging question "Do you want to continue?"
+                        # We use minimal matching.
+                        prompt_regex = r"(#|>|continue)"
+                        
+                        # Initial command
+                        out = net_connect.send_command(
+                            cmd_show, 
+                            expect_string=prompt_regex, 
+                            read_timeout=300,
+                            strip_prompt=False,
+                            strip_command=False
+                        )
                         output_text += out
-                        if "yes/no" in out.lower() or "confirm" in out.lower():
-                            net_connect.send_command("yes")
+                        
+                        # Handle Paging Loop
+                        page_count = 0
+                        while "continue" in out.lower() and page_count < 50: # Safety limit
+                            page_count += 1
+                            output_text += f"\n[AUTO-REPLY: YES (Page {page_count})]\n"
+                            
+                            # Send 'yes' and wait for next chunk (either end prompt or next continue)
+                            out = net_connect.send_command(
+                                "yes", 
+                                expect_string=prompt_regex, 
+                                read_timeout=300,
+                                strip_prompt=False, 
+                                strip_command=False
+                            )
+                            output_text += out
+                            
                         net_connect.send_command("setline 30")
 
             return self._parse_output(output_text, vendor), output_text
