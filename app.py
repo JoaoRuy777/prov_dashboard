@@ -13,8 +13,49 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.database import get_data, get_olts, insert_migration_data
 from src.processing import process_data, filter_data
 from src.olt_connector import OLTConnection
+from src.auth import init_db, verify_user, create_user, get_all_users
+
+# Initialize Auth Database
+init_db()
 
 # ... (Config and CSS remain headers) ...
+
+# --- Authentication ---
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'user_role' not in st.session_state:
+    st.session_state['user_role'] = None
+
+if not st.session_state['logged_in']:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+            
+        st.markdown("<h2 style='text-align: center;'>Login Central</h2>", unsafe_allow_html=True)
+        with st.form("login_form"):
+            email = st.text_input("E-mail")
+            senha = st.text_input("Senha", type="password")
+            submit = st.form_submit_button("Entrar", use_container_width=True)
+            
+            if submit:
+                success, role = verify_user(email, senha)
+                if success:
+                    st.session_state['logged_in'] = True
+                    st.session_state['user_role'] = role
+                    st.rerun()
+                else:
+                    st.error("Credenciais inválidas.")
+    st.stop()
+    
+# Se logado, renderiza tela (adicionar user/logout)
+with st.sidebar:
+    st.markdown(f"**Logado como:** `{st.session_state.get('user_role', 'Tecnico').upper()}`")
+    if st.button("Sair (Logout)"):
+        st.session_state['logged_in'] = False
+        st.session_state['user_role'] = None
+        st.rerun()
+    st.divider()
 
 # --- Sidebar Navigation ---
 # Logo Check
@@ -43,6 +84,9 @@ view_options = {
     'Migração (De/Para)': 'Migração (De/Para)',
     'Relatórios': 'Relatórios'
 }
+
+if st.session_state.get('user_role') == 'adm':
+    view_options['Gerenciar Usuários'] = 'Gerenciar Usuários'
 
 for option, label in view_options.items():
     if st.sidebar.button(label, use_container_width=True, type="primary" if st.session_state['selected_view'] == option else "secondary", key=option):
@@ -121,8 +165,8 @@ df_filtered_date = df_full
 
 # --- Views Implementation ---
 # BLOCKING LOGIC FIX:
-# Only block if we are NOT in 'Extração OLT' or 'Migração' view.
-if selected_view not in ['Extração OLT', 'Migração (De/Para)']:
+# Only block if we are NOT in 'Extração OLT', 'Migração (De/Para)' or 'Gerenciar Usuários' view.
+if selected_view not in ['Extração OLT', 'Migração (De/Para)', 'Gerenciar Usuários']:
     if not st.session_state['data_fetched'] and not submit_button:
         st.info("Utilize os filtros na barra lateral e clique em 'Buscar Dados' para começar.")
         st.stop()
@@ -448,6 +492,10 @@ elif selected_view == 'Extração OLT':
 # --- VIEW: Migração (De/Para) ---
 elif selected_view == 'Migração (De/Para)':
     st.title("Migração de OLT (De/Para)")
+    if st.session_state.get('user_role') != 'adm':
+        st.error("🚫 Acesso Negado: Apenas administradores (adm) podem processar migrações.")
+        st.stop()
+        
     st.markdown("Preencha os dados para iniciar o processo de migração.")
 
     with st.form("migration_form"):
@@ -539,6 +587,34 @@ elif selected_view == 'Migração (De/Para)':
                     st.info(f"Endpoint: {urlapiintegracao}")
                     
                     st.json(data_payload)
+
+# --- VIEW: Gerenciar Usuários ---
+elif selected_view == 'Gerenciar Usuários':
+    st.title("Gerenciamento de Usuários")
+    if st.session_state.get('user_role') != 'adm':
+        st.error("Acesso Negado.")
+        st.stop()
+        
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Cadastrar Novo Usuário")
+        with st.form("new_user_form"):
+            new_email = st.text_input("E-mail")
+            new_pass = st.text_input("Senha", type="password")
+            new_role = st.selectbox("Perfil", ["tecnico", "adm"])
+            sub_user = st.form_submit_button("Criar Usuário")
+            if sub_user:
+                if create_user(new_email, new_pass, new_role):
+                    st.success("Usuário criado com sucesso!")
+                else:
+                    st.error("Erro ao criar usuário (E-mail já existe).")
+                    
+    with col2:
+        st.subheader("Usuários Existentes")
+        users_list = get_all_users()
+        if users_list:
+            df_u = pd.DataFrame(users_list)
+            st.dataframe(df_u, use_container_width=True, hide_index=True)
 
 # --- Auto Refresh Logic ---
 if auto_refresh:
