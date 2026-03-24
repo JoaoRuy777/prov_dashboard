@@ -20,7 +20,7 @@ class OLTConnection:
         self.olt_ip = olt_ip
         self.user = user_override
         self.password = pass_override
-        self.port = 22 # Default SSH
+        self.port = None # Default None so we don't accidentally override standard ports
         
         # Jump Host Config 
         # Ideally this should be in secrets.toml or env vars, but we use constants here as requested
@@ -34,21 +34,12 @@ class OLTConnection:
             self._fetch_credentials()
 
     def _get_db_connection(self):
-        """Helper to get DB connection similar to database.py"""
-        if "postgres" not in st.secrets:
-            return None
-        db_config = st.secrets["postgres"]
+        """Helper to get the appropriate DB for this OLT"""
         try:
-             conn = psycopg2.connect(
-                host=db_config["host"],
-                database=db_config["dbname"],
-                user=db_config["user"],
-                password=db_config["password"],
-                port=db_config["port"]
-            )
-             return conn
+            from src.database import get_db_for_olt
+            return get_db_for_olt(self.olt_ip)
         except Exception as e:
-            print(f"DB Connection failed: {e}")
+            print(f"Failed to route DB connection internally: {e}")
             return None
 
     def _fetch_credentials(self):
@@ -66,9 +57,10 @@ class OLTConnection:
                 if df.iloc[0]['porta']:
                     self.port = int(df.iloc[0]['porta'])
             else:
-                print(f"No credentials found for {self.olt_ip}")
+                print(f"No credentials found for {self.olt_ip} in database.")
+                # We don't raise here, allow execute_command to handle missing user
         except Exception as e:
-            print(f"Error fetching credentials: {e}")
+            print(f"Error fetching credentials for {self.olt_ip}: {e}")
         finally:
             conn.close()
 
@@ -96,6 +88,8 @@ class OLTConnection:
         if self.port and self.port != 23 and vendor == 'Zhone':
              olt_protocol_port = self.port
 
+
+
         try:
             output_text = ""
             
@@ -115,73 +109,101 @@ class OLTConnection:
                     'port': tunnel.local_bind_port, # The random local port
                     'username': self.user,
                     'password': self.password,
+                    'global_delay_factor': 4,
+                    'session_log': 'debug_netmiko.log',
+                    'fast_cli': False,
+                    'banner_timeout': 60,
+                    'auth_timeout': 60
                 }
                 
                 # Connect
-                with ConnectHandler(**netmiko_params) as net_connect:
-                    # Nokia
+                try:
+                    # Nokia - Keep Netmiko
                     if vendor == 'Nokia':
-                        # environment inhibit-alarms might change prompt, causing timeout. 
-                        # We try running show directly.
-                        cmds = [
-                            f"show equipment ont status pon 1/1/{slot}/{port} | no-more"
-                        ]
-                        for cmd in cmds:
-                            output_text += f"\n--- CMD: {cmd} ---\n"
-                            # Relaxed matching and higher timeout
-                            output_text += net_connect.send_command(
-                                cmd, 
-                                strip_prompt=False, 
-                                strip_command=False, 
-                                read_timeout=60,
-                                expect_string=r"[#>]" # Generic prompt match
-                            )
+                        with ConnectHandler(**netmiko_params) as net_connect:
+                            # environment inhibit-alarms might change prompt, causing timeout. 
+                            # We try running show directly.
+                            cmds = [
+                                f"show equipment ont status pon 1/1/{slot}/{port} | no-more"
+                            ]
+                            for cmd in cmds:
+                                output_text += f"\n--- CMD: {cmd} ---\n"
+                                # Relaxed matching and higher timeout
+                                output_text += net_connect.send_command(
+                                    cmd, 
+                                    strip_prompt=False, 
+                                    strip_command=False, 
+                                    read_timeout=60,
+                                    expect_string=r"[#>]" # Generic prompt match
+                                )
 
-                    # Zhone
+                    # Zhone - Switch to telnetlib for full control
                     elif vendor == 'Zhone':
-                        net_connect.send_command("setline 0")
+                        # We must bypass Netmiko's strict login for Zhone because of "login:" prompt
+                        # Netmiko expects "Username:"
+                        import telnetlib
+                        
+                        # Connect to the LOCAL end of the tunnel
+                        tn = telnetlib.Telnet('127.0.0.1', tunnel.local_bind_port, timeout=10)
+                        
+                        # Handle Login
+                        # Expect 'login:'
+                        tn.read_until(b"login:", timeout=10)
+                        tn.write(self.user.encode('ascii') + b"\n")
+                        
+                        # Expect 'Password:' (or 'pass:', 'senha:')
+                        tn.read_until(b"assword:", timeout=10)
+                        tn.write(self.password.encode('ascii') + b"\n")
+                        
+                        # Expect Prompt (Assume '>' or '#')
+                        tn.read_until(b">", timeout=10)
+                        
+                        # Send Command
+                        # setline 0
+                        tn.write(b"setline 0\n")
+                        tn.read_until(b">", timeout=5)
                         
                         cmd_show = f"onu showall {slot}/{port}"
                         output_text += f"\n--- CMD: {cmd_show} ---\n"
+                        tn.write(cmd_show.encode('ascii') + b"\n")
                         
-                        # Regex to capture:
-                        # 1. Standard prompts (# or >)
-                        # 2. The specific paging question "Do you want to continue?"
-                        # We use minimal matching.
-                        prompt_regex = r"(#|>|continue)"
-                        
-                        # Initial command
-                        out = net_connect.send_command(
-                            cmd_show, 
-                            expect_string=prompt_regex, 
-                            read_timeout=300,
-                            strip_prompt=False,
-                            strip_command=False
-                        )
-                        output_text += out
-                        
-                        # Handle Paging Loop
-                        page_count = 0
-                        while "continue" in out.lower() and page_count < 50: # Safety limit
-                            page_count += 1
-                            output_text += f"\n[AUTO-REPLY: YES (Page {page_count})]\n"
+                        # Loop for output and paging
+                        # Zhone paging: "Do you want to continue?" -> Send "yes" (or just enter?) usually "yes"
+                        while True:
+                            # Read chunk
+                            chunk = tn.read_until(b"continue?", timeout=5)
+                            output_text += chunk.decode('ascii', errors='ignore')
                             
-                            # Send 'yes' and wait for next chunk (either end prompt or next continue)
-                            out = net_connect.send_command(
-                                "yes", 
-                                expect_string=prompt_regex, 
-                                read_timeout=300,
-                                strip_prompt=False, 
-                                strip_command=False
-                            )
-                            output_text += out
-                            
-                        net_connect.send_command("setline 30")
+                            if b"continue?" in chunk:
+                                tn.write(b"yes\n")
+                            else:
+                                break
+                        
+                        tn.write(b"setline 30\n")
+                        tn.close()
 
-            return self._parse_output(output_text, vendor), output_text
+
+                    if vendor == 'Nokia':
+                         return self._parse_output(output_text, vendor), output_text
+                    else:
+                         # Standardize return for Zhone
+                         return self._parse_output(output_text, vendor), output_text
+
+                except Exception as netmiko_err:
+                     err_str = str(netmiko_err)
+                     if "Authentication failed" in err_str:
+                         return None, "Erro de Autenticação: Login ou Senha incorretos na OLT."
+                     elif "Connection refused" in err_str:
+                         return None, f"Conexão Recusada: Porta {olt_protocol_port} fechada na OLT {self.olt_ip}."
+                     elif "timed out" in err_str.lower():
+                         return None, f"Timeout de Conexão: A OLT {self.olt_ip} não respondeu no tempo limite."
+                     return None, f"Erro na conexão de rede: {netmiko_err}"
 
         except Exception as e:
-            return None, f"Erro na conexão (via Tunnel): {str(e)}"
+            error_msg = f"Erro no Túnel SSH ({self.jump_host}): {str(e)}"
+            if "Authentication failed" in str(e):
+                error_msg = f"Erro de Autenticação no Jump Host ({self.jump_host}). Verifique as credenciais do dashboard."
+            return None, error_msg
 
     def _parse_output(self, text, vendor):
         """

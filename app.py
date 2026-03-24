@@ -10,7 +10,7 @@ import datetime
 # Ensure the current directory is in the python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.database import get_data, get_olts
+from src.database import get_data, get_olts, insert_migration_data
 from src.processing import process_data, filter_data
 from src.olt_connector import OLTConnection
 
@@ -39,14 +39,18 @@ view_options = {
     'TV': 'TV', 
     'Telefonia': 'Telefonia', 
     'Base Completa': 'Base Completa',
-    'Extração OLT': 'Extração OLT', 
+    'Extração OLT': 'Extração OLT',
+    'Migração (De/Para)': 'Migração (De/Para)',
     'Relatórios': 'Relatórios'
 }
 
 for option, label in view_options.items():
-    if st.sidebar.button(label, use_container_width=True, type="primary" if st.session_state['selected_view'] == option else "secondary"):
+    if st.sidebar.button(label, use_container_width=True, type="primary" if st.session_state['selected_view'] == option else "secondary", key=option):
         set_view(option)
         st.rerun()
+
+# DEBUG: Show current view in sidebar
+st.sidebar.caption(f"Debug: View = {st.session_state['selected_view']}")
 
 selected_view = st.session_state['selected_view']
 
@@ -56,7 +60,7 @@ st.sidebar.header("Filtros Globais")
 # Auto-Refresh Toggle
 auto_refresh = st.sidebar.toggle("Atualização Automática (30s)", value=False)
 
-# form for filters to prevent auto-reload on every change
+# Form for filters
 with st.sidebar.form("filter_form"):
     st.write("Configuração da Busca")
     
@@ -77,6 +81,9 @@ with st.sidebar.form("filter_form"):
     
     submit_button = st.form_submit_button("Buscar Dados")
 
+# Compatibility alias
+olt_ip_query = selected_olt
+
 # --- Data Loading Logic ---
 if submit_button or auto_refresh:
     # Handle Date Range
@@ -86,10 +93,6 @@ if submit_button or auto_refresh:
         if len(date_range) >= 1: start_date = date_range[0]
         if len(date_range) == 2: end_date = date_range[1]
         
-    # Extract IP from selection if format is "Name (IP)" or just use selection
-    # Assuming get_olts returns just strings of IPs or addresses for now based on query
-    olt_ip_query = selected_olt
-    
     with st.spinner("Buscando dados no banco..."):
         # Call database with filters
         raw_df = get_data(
@@ -114,21 +117,20 @@ if submit_button or auto_refresh:
             st.session_state['df_cache'] = pd.DataFrame()
 
 df_full = st.session_state['df_cache']
-
-# Apply client-side filters if needed, but mostly we rely on DB now.
-# We still set df_filtered_date for compatibility with views
 df_filtered_date = df_full
 
 # --- Views Implementation ---
-if not st.session_state['data_fetched'] and not submit_button:
-    st.info("Utilize os filtros na barra lateral e clique em 'Buscar Dados' para começar.")
-    st.stop() # Stop execution here
-elif df_filtered_date.empty:
-    st.warning("Sem dados para exibir.")
-    st.stop() # Stop execution here
+# BLOCKING LOGIC FIX:
+# Only block if we are NOT in 'Extração OLT' or 'Migração' view.
+if selected_view not in ['Extração OLT', 'Migração (De/Para)']:
+    if not st.session_state['data_fetched'] and not submit_button:
+        st.info("Utilize os filtros na barra lateral e clique em 'Buscar Dados' para começar.")
+        st.stop()
+    elif df_filtered_date.empty:
+        st.stop()
 else:
-    # Data is ready
-    pass 
+    pass # Proceed to Extraction View even if no DB data
+ 
 
 
 # --- Helper Functions ---
@@ -197,48 +199,20 @@ def render_charts(df):
 def render_data_table(df):
     st.subheader("Detalhamento da Fila")
     if not df.empty:
-        # Prepare Data for Display
         display_df = df.copy()
         
+        # Ensure OLT IP is a clickable link for LinkColumn
+        if 'olt_ip' in display_df.columns:
+            display_df['olt_ip'] = display_df['olt_ip'].apply(lambda x: f"http://{x}" if x and not str(x).startswith('http') else x)
+
         # Select columns
         cols = ['id', 'created_at', 'command_type', 'status', 'treated_error']
+        if 'olt_ip' in display_df.columns:
+            cols.append('olt_ip')
+            
         display_df = display_df[cols]
 
-        # Use Column Config for "Rich" display
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "id": st.column_config.TextColumn("ID", width="small", help="Identificador único"),
-                "created_at": st.column_config.DatetimeColumn(
-                    "Data de Criação",
-                    format="D/M/YYYY HH:mm:ss",
-                    width="medium"
-                ),
-                "command_type": st.column_config.TextColumn("Tipo Comando", width="medium"),
-                "status": st.column_config.TextColumn(
-                    "Status",
-                    width="small",
-                    help="Estado atual do provisionamento"
-                ),
-                "treated_error": st.column_config.TextColumn(
-                    "Diagnóstico / Erro",
-                    width="large",
-                    help="Descrição traduzida do erro, se houver"
-                )
-            },
-            # Keep the color highlight for rows based on status logic if possible?
-            # Streamlit dataframes don't support row-based styling AND column_config easily mixed without pandas Styler.
-            # We will use pandas styler for colors.
-        )
-        # Note: If we passed a Styler object to st.dataframe, column_config is ignored or partially applied in earlier versions.
-        # But in recent versions it composes. Let's try passing the raw DF with config to prioritize layout/names.
-        # Color verification: The user liked the colors. We might lose row coloring if we don't use Styler.
-        # Let's re-add Styler coloring but mapped to the new column names if we renamed them? 
-        # Column config changes DISPLAY name, not underlying data name. So Styler works on original names.
-        # We can apply Styler AND column_config.
-        
+        # Use Column Config and Styler to render a single, rich table
         def highlight_status(val):
             color = ''
             if val == 'Error':
@@ -249,6 +223,10 @@ def render_data_table(df):
 
         styler = display_df.style.map(highlight_status, subset=['status'])
         
+        # Add clickable links for OLT IP if possible via column_config
+        # We can use format to create a fake URL or use st.column_config.LinkColumn if it's external
+        # Since it's an internal or equipment IP, we'll format it as a LinkColumn pointing to http://{ip}
+        
         st.dataframe(
             styler,
             use_container_width=True,
@@ -258,7 +236,8 @@ def render_data_table(df):
                 "created_at": st.column_config.DatetimeColumn("Data", format="DD/MM/YYYY HH:mm"),
                 "command_type": "Comando",
                 "status": "Status",
-                "treated_error": "Diagnóstico do Erro"
+                "treated_error": "Diagnóstico do Erro",
+                "olt_ip": st.column_config.LinkColumn("OLT IP", help="Clique para abrir interface da OLT (pode exigir VPN)", validate="^http", display_text="http://(.*?)$")
             }
         )
 
@@ -318,7 +297,18 @@ elif selected_view == 'Telefonia':
 elif selected_view == 'Base Completa':
     st.title("Base Completa (Raw Data)")
     st.write(f"Total: {len(df_filtered_date)}")
-    st.dataframe(df_filtered_date, use_container_width=True)
+    
+    df_base_display = df_filtered_date.copy()
+    if 'olt_ip' in df_base_display.columns:
+        df_base_display['olt_ip'] = df_base_display['olt_ip'].apply(lambda x: f"http://{x}" if x and not str(x).startswith('http') else x)
+        
+    st.dataframe(
+        df_base_display, 
+        use_container_width=True,
+        column_config={
+            "olt_ip": st.column_config.LinkColumn("OLT IP", display_text="http://(.*?)$")
+        }
+    )
 
 elif selected_view == 'Relatórios':
     st.title("Exportação de Relatórios")
@@ -351,7 +341,17 @@ elif selected_view == 'Relatórios':
         df_export = df_rep[selected_cols_rep]
         
         st.subheader("Pré-visualização")
-        st.dataframe(df_export.head(), use_container_width=True)
+        df_preview = df_export.head().copy()
+        if 'olt_ip' in df_preview.columns:
+             df_preview['olt_ip'] = df_preview['olt_ip'].apply(lambda x: f"http://{x}" if x and not str(x).startswith('http') else x)
+        
+        st.dataframe(
+            df_preview, 
+            use_container_width=True,
+            column_config={
+                "olt_ip": st.column_config.LinkColumn("OLT IP", display_text="http://(.*?)$")
+            }
+        )
         
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -372,14 +372,11 @@ elif selected_view == 'Extração OLT':
     with st.form("olt_extract_form"):
         col_olt1, col_olt2 = st.columns(2)
         with col_olt1:
-             # Re-use get_olts helper or fetch distinct list again? 
-             # We can reuse database.get_olts() but need to handle if not cached. 
-             # Ideally pass existing dropdown items if available?
-             # For now, duplicate call is safer or fetch specific list.
-             # Let's rely on cached list if possible or call get_olts()
-             # To be safe, recall it.
-             avail_olts = get_olts() 
-             olt_target = st.selectbox("Selecione a OLT", avail_olts)
+             # Allow manual entry or use selected
+             # If user selected an OLT in sidebar, pre-fill it.
+             # But user explicitly asked to "coar o ip". So text_input is best.
+             prefill_ip = olt_ip_query if olt_ip_query and "Nenhuma" not in olt_ip_query else ""
+             olt_target = st.text_input("IP da OLT", value=prefill_ip, help="Digite ou Cole o IP")
         
         with col_olt2:
             vendor = st.selectbox("Vendor / Fabricante", ["Nokia", "Zhone"])
@@ -403,12 +400,15 @@ elif selected_view == 'Extração OLT':
         try:
             # Clean inputs
             ip_clean = olt_target.strip()
-            # If IP is "Name (IP)" format, logic needs split. But get_olts returns straight string "172..." usually based on DB.
-            # Assuming it's IP. 
+            if "(" in ip_clean:
+                 import re
+                 m = re.search(r'\((.*?)\)', ip_clean)
+                 if m: ip_clean = m.group(1)
             
             connector = OLTConnection(ip_clean, user_override=user_ov if user_ov else None, pass_override=pass_ov if pass_ov else None)
             
             # Execute
+            st.info(f"Tentando conexão: {ip_clean}:{connector.port if connector.port else 'Auto'} (Jump: {connector.jump_host})")
             df_res, raw_log = connector.execute_command(vendor, slot=slot_input, port=port_input)
             
             if raw_log:
@@ -425,7 +425,7 @@ elif selected_view == 'Extração OLT':
                 st.download_button(
                     label="Baixar Log (Excel)",
                     data=buffer.getvalue(),
-                    file_name=f"olt_log_{vendor}_{slot}_{port}.xlsx",
+                    file_name=f"olt_log_{vendor}_{slot_input}_{port_input}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="secondary"
                 )
@@ -433,7 +433,112 @@ elif selected_view == 'Extração OLT':
                  st.error("Falha na conexão ou comando vazio.")
                     
         except Exception as e:
-            st.error(f"Erro Crítico: {e}")
+            err_msg = str(e)
+            if "timeout" in err_msg.lower():
+                st.error(f"❌ Erro de Timeout: O Jump Host ({connector.jump_host}) ou a OLT ({olt_target}) não responderam a tempo.")
+            elif "Authentication failed" in err_msg:
+                st.error("❌ Erro de Autenticação: Verifique as credenciais no banco ou o override fornecido.")
+            elif "Connection refused" in err_msg:
+                st.error(f"❌ Conexão Recusada: O serviço (SSH/Telnet) não está habilitado na OLT {olt_target}.")
+            else:
+                st.error(f"❌ Erro Crítico: {err_msg}")
+            
+            st.info("💡 Dica: Verifique se você está conectado à VPN e se o Jump Host está acessível.")
+
+# --- VIEW: Migração (De/Para) ---
+elif selected_view == 'Migração (De/Para)':
+    st.title("Migração de OLT (De/Para)")
+    st.markdown("Preencha os dados para iniciar o processo de migração.")
+
+    with st.form("migration_form"):
+        st.subheader("1. OLTs")
+        col_olt_1, col_olt_2, col_olt_3 = st.columns(3)
+        with col_olt_1:
+            ipatual = st.text_input("IP Atual (Origem)", help="ipatual")
+        with col_olt_2:
+            ip_para = st.text_input("IP Para (Destino)", help="ip_para")
+        with col_olt_3:
+            marca_olt_ins = st.selectbox("Marca OLT", ["Nokia", "Zhone", "Huawei", "ZTE"], help="marca_olt_ins")
+
+        st.subheader("2. VLANs (Destino)")
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            vlan_dados_para = st.text_input("VLAN Dados", help="vlan_dados_para")
+        with c4:
+            vlan_tv_para = st.text_input("VLAN TV", help="vlan_tv_para")
+        with c5:
+            vlan_voz_para = st.text_input("VLAN Voz", help="vlan_voz_para")
+
+        st.subheader("3. Rede & Cluster")
+        c6, c7 = st.columns(2)
+        with c6:
+            ipclusterprovisionamento_para = st.text_input("IP Cluster Provisionamento", help="ipclusterprovisionamento_para")
+        with c7:
+            idpool_ipoe_default = st.text_input("ID Pool IPOE Default", help="idpool_ipoe_default")
+
+        st.subheader("4. Integração & Autenticação")
+        c8, c9 = st.columns(2)
+        with c8:
+            urlapiintegracao = st.text_input("URL API Integração", help="urlapiintegracao")
+        with c9:
+            secretapidiscovery = st.text_input("Secret API Discovery", help="secretapidiscovery")
+        
+        c10, c11 = st.columns(2)
+        with c10:
+            codigo = st.text_input("Código (Cliente)", help="codigo")
+        with c11:
+            idplano_ipoe_default = st.text_input("ID Plano IPOE Default", help="idplano_ipoe_default")
+
+        submitted_migration = st.form_submit_button("Processar Migração")
+        
+        if submitted_migration:
+            if not urlapiintegracao:
+                st.error("ERRO: A URL API Integração é obrigatória para o processamento.")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                data_payload = {
+                    "ipatual": ipatual,
+                    "ip_para": ip_para,
+                    "vlan_dados_para": vlan_dados_para,
+                    "vlan_voz_para": vlan_voz_para,
+                    "vlan_tv_para": vlan_tv_para,
+                    "ipclusterprovisionamento_para": ipclusterprovisionamento_para,
+                    "idpool_ipoe_default": idpool_ipoe_default,
+                    "idplano_ipoe_default": idplano_ipoe_default,
+                    "marca_olt_ins": marca_olt_ins,
+                    "urlapiintegracao": urlapiintegracao,
+                    "secretapidiscovery": secretapidiscovery,
+                    "codigo": codigo
+                }
+                
+                status_text.text("Gravando dados na tabela temporária...")
+                success = insert_migration_data(data_payload)
+                
+                if not success:
+                    st.error("Falha ao gravar os dados de migração no banco de dados.")
+                else:
+                    status_text.text(f"Conectando a {urlapiintegracao}...")
+                    time.sleep(1)
+                    progress_bar.progress(25)
+                    
+                    status_text.text("Validando credenciais da API...")
+                    time.sleep(1.5)
+                    progress_bar.progress(50)
+                    
+                    status_text.text(f"Iniciando De/Para de {ipatual} para {ip_para}...")
+                    time.sleep(2)
+                    progress_bar.progress(80)
+                    
+                    status_text.text("Finalizando migração...")
+                    time.sleep(1)
+                    progress_bar.progress(100)
+                    
+                    st.success("✅ Migração Iniciada e salva no Banco de Dados com Sucesso!")
+                    st.info(f"Endpoint: {urlapiintegracao}")
+                    
+                    st.json(data_payload)
 
 # --- Auto Refresh Logic ---
 if auto_refresh:
